@@ -2,7 +2,6 @@ import asyncio
 import importlib
 import importlib.metadata
 import importlib.util
-import json
 import os
 import platform
 import re
@@ -13,9 +12,10 @@ import numpy as np
 import onnxruntime as rt
 from numpy.typing import NDArray
 
-from .config import MAX_PHONEME_LENGTH, SAMPLE_RATE, EspeakConfig, KoKoroConfig
+from misaki import ja
+
+from .config import MAX_PHONEME_LENGTH, SAMPLE_RATE, KoKoroConfig, get_vocab
 from .log import log
-from .tokenizer import Tokenizer
 from .trim import trim as trim_audio
 
 
@@ -23,15 +23,13 @@ class Kokoro:
     def __init__(
         self,
         model_path: str,
-        voices_path: str,
-        espeak_config: EspeakConfig | None = None,
-        vocab_config: dict | str | None = None,
+        voice_path: str
     ):
         # Show useful information for bug reports
         log.debug(
             f"koko-onnx version {importlib.metadata.version('kokoro-onnx')} on {platform.platform()} {platform.version()}"
         )
-        self.config = KoKoroConfig(model_path, voices_path, espeak_config)
+        self.config = KoKoroConfig(model_path, voice_path)
         self.config.validate()
 
         # See list of providers https://github.com/microsoft/onnxruntime/issues/22101#issuecomment-2357667377
@@ -49,46 +47,18 @@ class Kokoro:
 
         log.debug(f"Providers: {providers}")
         self.sess = rt.InferenceSession(model_path, providers=providers)
-        self.voices: np.ndarray = np.load(voices_path)
+        self.voice = np.fromfile(voice_path, dtype=np.float32).reshape(-1, 1, 256)
 
-        vocab = self._load_vocab(vocab_config)
-        self.tokenizer = Tokenizer(espeak_config, vocab=vocab)
+        g2p = ja.JAG2P()
+        self.phonemize = lambda x: g2p(x)[0]
+        self.vocab = get_vocab()
 
-    @classmethod
-    def from_session(
-        cls,
-        session: rt.InferenceSession,
-        voices_path: str,
-        espeak_config: EspeakConfig | None = None,
-        vocab_config: dict | str | None = None,
-    ):
-        instance = cls.__new__(cls)
-        instance.sess = session
-        instance.config = KoKoroConfig(session._model_path, voices_path, espeak_config)
-        instance.config.validate()
-        instance.voices = np.load(voices_path)
-
-        vocab = instance._load_vocab(vocab_config)
-        instance.tokenizer = Tokenizer(espeak_config, vocab=vocab)
-        return instance
-
-    def _load_vocab(self, vocab_config: dict | str | None) -> dict:
-        """Load vocabulary from config file or dictionary.
-
-        Args:
-            vocab_config: Path to vocab config file or dictionary containing vocab.
-
-        Returns:
-            Loaded vocabulary dictionary or empty dictionary if no config provided.
-        """
-
-        if isinstance(vocab_config, str):
-            with open(vocab_config, encoding="utf-8") as fp:
-                config = json.load(fp)
-                return config["vocab"]
-        if isinstance(vocab_config, dict):
-            return vocab_config["vocab"]
-        return {}
+    def _tokenize(self, phonemes):
+        if len(phonemes) > MAX_PHONEME_LENGTH:
+            raise ValueError(
+                f"text is too long, must be less than {MAX_PHONEME_LENGTH} phonemes"
+            )
+        return [i for i in map(self.vocab.get, phonemes) if i is not None]
 
     def _create_audio(
         self, phonemes: str, voice: NDArray[np.float32], speed: float
@@ -100,7 +70,7 @@ class Kokoro:
             )
         phonemes = phonemes[:MAX_PHONEME_LENGTH]
         start_t = time.time()
-        tokens = np.array(self.tokenizer.tokenize(phonemes), dtype=np.int64)
+        tokens = np.array(self._tokenize(phonemes), dtype=np.int64)
         assert len(tokens) <= MAX_PHONEME_LENGTH, (
             f"Context length is {MAX_PHONEME_LENGTH}, but leave room for the pad token 0 at the start & end"
         )
@@ -129,9 +99,6 @@ class Kokoro:
             f"Created audio in length of {audio_duration:.2f}s for {len(phonemes)} phonemes in {create_duration:.2f}s (RTF: {rtf:.2f}"
         )
         return audio, SAMPLE_RATE
-
-    def get_voice_style(self, name: str) -> NDArray[np.float32]:
-        return self.voices[name]
 
     def _split_phonemes(self, phonemes: str) -> list[str]:
         """
@@ -170,10 +137,7 @@ class Kokoro:
     def create(
         self,
         text: str,
-        voice: str | NDArray[np.float32],
         speed: float = 1.0,
-        lang: str = "en-us",
-        is_phonemes: bool = False,
         trim: bool = True,
     ) -> tuple[NDArray[np.float32], int]:
         """
@@ -181,15 +145,10 @@ class Kokoro:
         """
         assert speed >= 0.5 and speed <= 2.0, "Speed should be between 0.5 and 2.0"
 
-        if isinstance(voice, str):
-            assert voice in self.voices, f"Voice {voice} not found in available voices"
-            voice = self.get_voice_style(voice)
-
         start_t = time.time()
-        if is_phonemes:
-            phonemes = text
-        else:
-            phonemes = self.tokenizer.phonemize(text, lang)
+
+        phonemes = self.phonemize(text)
+
         # Create batches of phonemes by splitting spaces to MAX_PHONEME_LENGTH
         batched_phoenemes = self._split_phonemes(phonemes)
 
@@ -198,7 +157,7 @@ class Kokoro:
             f"Creating audio for {len(batched_phoenemes)} batches for {len(phonemes)} phonemes"
         )
         for phonemes in batched_phoenemes:
-            audio_part, _ = self._create_audio(phonemes, voice, speed)
+            audio_part, _ = self._create_audio(phonemes, self.voice, speed)
             if trim:
                 # Trim leading and trailing silence for a more natural sound concatenation
                 # (initial ~2s, subsequent ~0.02s)
@@ -211,10 +170,7 @@ class Kokoro:
     async def create_stream(
         self,
         text: str,
-        voice: str | NDArray[np.float32],
         speed: float = 1.0,
-        lang: str = "en-us",
-        is_phonemes: bool = False,
         trim: bool = True,
     ) -> AsyncGenerator[tuple[NDArray[np.float32], int], None]:
         """
@@ -222,14 +178,7 @@ class Kokoro:
         """
         assert speed >= 0.5 and speed <= 2.0, "Speed should be between 0.5 and 2.0"
 
-        if isinstance(voice, str):
-            assert voice in self.voices, f"Voice {voice} not found in available voices"
-            voice = self.get_voice_style(voice)
-
-        if is_phonemes:
-            phonemes = text
-        else:
-            phonemes = self.tokenizer.phonemize(text, lang)
+        phonemes = self.phonemize(text)
 
         batched_phonemes = self._split_phonemes(phonemes)
         queue: asyncio.Queue[tuple[NDArray[np.float32], int] | None] = asyncio.Queue()
@@ -240,7 +189,7 @@ class Kokoro:
                 loop = asyncio.get_event_loop()
                 # Execute in separate thread since it's blocking operation
                 audio_part, sample_rate = await loop.run_in_executor(
-                    None, self._create_audio, phonemes, voice, speed
+                    None, self._create_audio, phonemes, self.voice, speed
                 )
                 if trim:
                     # Trim leading and trailing silence for a more natural sound concatenation
@@ -258,6 +207,3 @@ class Kokoro:
             if chunk is None:
                 break
             yield chunk
-
-    def get_voices(self) -> list[str]:
-        return list(sorted(self.voices.keys()))
